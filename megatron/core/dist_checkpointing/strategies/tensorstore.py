@@ -39,6 +39,7 @@ class TensorStoreLoadShardedStrategy(LoadShardedStrategy):
             _load_from_array,
             checkpoint_dir=checkpoint_dir,
             load_directly_on_device=self.load_directly_on_device,
+            allow_shape_mismatch=True # A HACK HERE
         )
         dict_list_map_inplace(load_fn, sharded_state_dict)
         return sharded_state_dict
@@ -76,9 +77,10 @@ def _load_from_array(
     checkpoint_dir: Path,
     load_directly_on_device: bool = False,
     apply_flattened_range: bool = True,
+    **kwargs,
 ):
-    x = _load_regular_chunk(sharded_tensor, checkpoint_dir)
-    ten = postprocess_numpy_array(x, sharded_tensor, apply_flattened_range)
+    x = _load_regular_chunk(sharded_tensor, checkpoint_dir, **kwargs)
+    ten = postprocess_numpy_array(x, sharded_tensor, apply_flattened_range, **kwargs)
     if load_directly_on_device:
         sharded_tensor.data.data.copy_(ten)
         return sharded_tensor.data
@@ -86,14 +88,15 @@ def _load_from_array(
         return ten
 
 
-def _load_regular_chunk(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
+def _load_regular_chunk(sharded_tensor: ShardedTensor, checkpoint_dir: Path, **kwargs):
     assert isinstance(sharded_tensor, ShardedTensor), type(sharded_tensor)
     arr = open_ts_array(checkpoint_dir / sharded_tensor.key)
     if sharded_tensor.global_shape == arr.shape:
         x = (
             arr[sharded_tensor.global_slice()].read().result()
         )  # flattened tensors loading is delayed
-    elif sharded_tensor.allow_shape_mismatch:
+    elif sharded_tensor.allow_shape_mismatch or kwargs.get('allow_shape_mismatch', False):
+        print(f"WARNING: ALLOWING shape mismatch for key {sharded_tensor.key} in `_load_regular_chunk`")
         global_slice = merge_global_slice_with_shape(
             sharded_tensor.global_slice(), arr.shape, sharded_tensor.key
         )

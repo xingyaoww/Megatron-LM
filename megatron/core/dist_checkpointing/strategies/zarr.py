@@ -202,7 +202,7 @@ def _open_zarr_array_verbose(path: Path, mode: str, **open_kwargs):
         raise CheckpointingException(err_msg) from e
 
 
-def postprocess_numpy_array(loaded_array, sharded_tensor, apply_flattened_range=True):
+def postprocess_numpy_array(loaded_array, sharded_tensor, apply_flattened_range=True, **kwargs):
     x = loaded_array
     if HAS_BFLOAT16 and x.dtype == np.dtype('bfloat16'):
         x = x.astype(np.dtype('float32'))
@@ -212,7 +212,8 @@ def postprocess_numpy_array(loaded_array, sharded_tensor, apply_flattened_range=
         x = torch.from_numpy(x)
     # TODO: consider some other consistency checks
     if x.shape != sharded_tensor.local_shape:
-        if sharded_tensor.allow_shape_mismatch:
+        if sharded_tensor.allow_shape_mismatch or kwargs.get('allow_shape_mismatch', False):
+            print(f"WARNING: ALLOWING shape mismatch for key {sharded_tensor.key} in `postprocess_numpy_array`")
             x = pad_to_expected_shape(x, sharded_tensor)
         else:
             _msg = (
