@@ -22,14 +22,15 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
+_te_version = packaging.version.Version(version("transformer-engine"))
+
 
 def _get_extra_te_kwargs(config: TransformerConfig):
     extra_transformer_engine_kwargs = {
         "params_dtype": config.params_dtype,
     }
 
-    te_version = packaging.version.Version(version("transformer-engine"))
-    if te_version >= packaging.version.Version("0.12.0"):
+    if _te_version >= packaging.version.Version("0.12.0"):
         if config.use_cpu_initialization:
             extra_transformer_engine_kwargs["device"] = 'cpu'
         else:
@@ -115,14 +116,26 @@ class TELinear(te.pytorch.Linear):
 
         extra_kwargs = _get_extra_te_kwargs(config)
 
-        te_version = packaging.version.Version(version("transformer-engine"))
-        if te_version >= packaging.version.Version("0.8.0"):
+        if _te_version >= packaging.version.Version("0.8.0"):
             if self.config.tp_comm_overlap:
-                extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
-                extra_kwargs["ub_atomic_gemm_ag"] = self.config.tp_comm_atomic_ag
-                extra_kwargs["ub_split_rs"] = self.config.tp_comm_split_rs
-                extra_kwargs["ub_atomic_gemm_rs"] = self.config.tp_comm_atomic_rs
-                if te_version > packaging.version.Version("1.0.0"):
+                if _te_version > packaging.version.Version("1.5.0"):
+                    # Use old overlap flags if they were supplied instead
+                    extra_kwargs["ub_overlap_ag"] = (
+                        self.config.tp_comm_overlap_ag
+                        if hasattr(self.config, "tp_comm_overlap_ag")
+                        else self.config.tp_comm_split_ag or self.config.tp_comm_atomic_ag
+                    )
+                    extra_kwargs["ub_overlap_rs"] = (
+                        self.config.tp_comm_overlap_rs
+                        if hasattr(self.config, "tp_comm_overlap_rs")
+                        else self.config.tp_comm_split_rs or self.config.tp_comm_atomic_rs
+                    )
+                else:
+                    extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
+                    extra_kwargs["ub_atomic_gemm_ag"] = self.config.tp_comm_atomic_ag
+                    extra_kwargs["ub_split_rs"] = self.config.tp_comm_split_rs
+                    extra_kwargs["ub_atomic_gemm_rs"] = self.config.tp_comm_atomic_rs
+                if _te_version > packaging.version.Version("1.0.0"):
                     assert (
                         tp_comm_buffer_name is not None
                     ), "Buffer name should be set to configure communication overlap settings"
@@ -204,21 +217,34 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         extra_kwargs = _get_extra_te_kwargs(config)
 
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
-        te_version = packaging.version.Version(version("transformer-engine"))
-        if te_version >= packaging.version.Version("0.11.0"):
+        if _te_version >= packaging.version.Version("0.11.0"):
             extra_kwargs["normalization"] = self.config.normalization
         elif self.config.normalization != "LayerNorm":
             raise ValueError(
-                f"Transformer Engine v{te_version} does not support {self.config.normalization}."
+                f"Transformer Engine v{_te_version} does not support {self.config.normalization}."
             )
 
-        if te_version >= packaging.version.Version("0.8.0"):
+        if _te_version >= packaging.version.Version("0.8.0"):
             if self.config.tp_comm_overlap:
                 extra_kwargs["ub_bulk_wgrad"] = self.config.tp_comm_bulk_wgrad
                 extra_kwargs["ub_bulk_dgrad"] = self.config.tp_comm_bulk_dgrad
-                extra_kwargs["ub_atomic_gemm_ag"] = self.config.tp_comm_atomic_ag
-                extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
-                if te_version > packaging.version.Version("1.0.0"):
+                if _te_version > packaging.version.Version("1.5.0"):
+                    # Use old overlap flags if they were supplied instead
+                    extra_kwargs["ub_overlap_ag"] = (
+                        self.config.tp_comm_overlap_ag
+                        if hasattr(self.config, "tp_comm_overlap_ag")
+                        else self.config.tp_comm_split_ag or self.config.tp_comm_atomic_ag
+                    )
+                    if _te_version > packaging.version.Version("1.6.0.dev0"):
+                        extra_kwargs["ub_overlap_rs_dgrad"] = (
+                            self.config.tp_comm_overlap_rs_dgrad
+                            if hasattr(self.config, "tp_comm_overlap_rs_dgrad")
+                            else False
+                        )
+                else:
+                    extra_kwargs["ub_atomic_gemm_ag"] = self.config.tp_comm_atomic_ag
+                    extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
+                if _te_version > packaging.version.Version("1.0.0"):
                     assert (
                         tp_comm_buffer_name is not None
                     ), "Buffer name should be set to configure communication overlap settings"
@@ -394,26 +420,25 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
 
         extra_kwargs = {}
-        te_version = packaging.version.Version(version("transformer-engine"))
-        if te_version >= packaging.version.Version("0.11.0"):
+        if _te_version >= packaging.version.Version("0.11.0"):
             extra_kwargs["num_gqa_groups"] = self.config.num_query_groups
         elif self.config.num_query_groups != self.config.num_attention_heads:
             raise ValueError(
-                f"Transformer Engine v{te_version} does not support Grouped Query Attention, "
+                f"Transformer Engine v{_te_version} does not support Grouped Query Attention, "
                 f"use a newer version of Transformer Engine. "
                 f"(num_query_groups ({self.config.num_query_groups}) != "
                 f"num_attention_heads ({self.config.num_attention_heads}))"
             )
 
-        if te_version >= packaging.version.Version("0.10.0"):
+        if _te_version >= packaging.version.Version("0.10.0"):
             extra_kwargs["attention_type"] = attention_type
             # older version don't need attention_type
 
-        if te_version > packaging.version.Version("0.12.0"):
+        if _te_version > packaging.version.Version("0.12.0"):
             self.te_forward_mask_type = True
 
         # Only Transformer-Engine version >= 1.0.0 supports context parallelism
-        if te_version >= packaging.version.Version("1.0.0"):
+        if _te_version >= packaging.version.Version("1.0.0"):
             if getattr(TEDotProductAttention, "cp_stream") is None:
                 TEDotProductAttention.cp_stream = torch.cuda.Stream()
             extra_kwargs["cp_group"] = get_context_parallel_group(check_initialized=False)
@@ -428,9 +453,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         if config.window_size is not None:
             # Check version
-            assert te_version >= packaging.version.Version(
+            assert _te_version >= packaging.version.Version(
                 "1.2.0"
-            ), f"Transformer-Engine version ({str(te_version)}) must be >= 1.2.0 to support sliding window attention."
+            ), f"Transformer-Engine version ({str(_te_version)}) must be >= 1.2.0 to support sliding window attention."
             extra_kwargs['window_size'] = config.window_size
 
         super().__init__(
@@ -462,14 +487,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         packed_seq_kwargs = (
             dataclasses.asdict(packed_seq_params) if packed_seq_params is not None else {}
         )
-        te_version = packaging.version.Version(version("transformer-engine"))
         # overwrite self.qkv_format depending on self.config.apply_rope_fusion, which can be set after init
-        if self.config.apply_rope_fusion and te_version > packaging.version.Version("0.13.0"):
+        if self.config.apply_rope_fusion and _te_version > packaging.version.Version("0.13.0"):
             self.qkv_format = 'bshd'
 
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
-        if te_version < packaging.version.Version("1.3.0"):
+        if _te_version < packaging.version.Version("1.3.0"):
             # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H copies (#555)
             # These two arguments did not exist prior to 1.3.0
             packed_seq_kwargs.pop("max_seqlen_q", None)
@@ -502,6 +526,75 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             return core_attn_out.transpose(0, 1)
         else:
             return core_attn_out
+
+
+class TEDelayedScaling(te.common.recipe.DelayedScaling):
+    """
+    Wrapper for the Transformer-Engine's `DelayedScaling` layer.
+    """
+
+    def __init__(
+        self,
+        config: ModelParallelConfig,
+        fp8_format: int,
+        override_linear_precision: tuple = (False, False, False),
+    ):
+        extra_kwargs = _get_extra_te_kwargs(config)
+        if _te_version >= packaging.version.Version("1.6.0.dev0"):
+            extra_kwargs["fp8_dpa"] = config.fp8_dot_product_attention
+            extra_kwargs["fp8_mha"] = config.fp8_multi_head_attention
+
+        super().__init__(
+            margin=config.fp8_margin,
+            interval=config.fp8_interval,
+            fp8_format=fp8_format,
+            amax_compute_algo=config.fp8_amax_compute_algo,
+            amax_history_len=config.fp8_amax_history_len,
+            override_linear_precision=override_linear_precision,
+            **extra_kwargs,
+        )
+
+
+def te_checkpoint(
+    forward_func,
+    distribute_saved_activations,
+    get_rng_state_tracker,
+    tp_group,
+    hidden_states,
+    attention_mask,
+    context,
+    context_mask,
+    rotary_pos_emb,
+    packed_seq_params,
+):
+    from transformer_engine.pytorch.distributed import checkpoint
+
+    if _te_version >= packaging.version.Version("1.5.0"):
+        return checkpoint(
+            forward_func,
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb,
+            packed_seq_params,
+            distribute_saved_activations=distribute_saved_activations,
+            get_rng_state_tracker=get_rng_state_tracker,
+            tp_group=tp_group,
+        )
+    else:
+        return checkpoint(
+            forward_func,
+            distribute_saved_activations,
+            get_rng_state_tracker,
+            tp_group,
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb,
+            packed_seq_params,
+        )
 
 
 try:

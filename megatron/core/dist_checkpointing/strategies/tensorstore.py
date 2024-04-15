@@ -114,7 +114,7 @@ def _load_regular_chunk(sharded_tensor: ShardedTensor, checkpoint_dir: Path, **k
 def open_ts_array(arr_path: Path):
     """Opens a Zarr file array with Tensorstore with basic setting.
 
-    Arguments:
+    Args:
         arr_path (Path): path to a Zarr (Tensorstore) array
     """
     spec = {'driver': 'zarr', 'metadata_key': '.zarray', 'kvstore': {}}

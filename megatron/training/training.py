@@ -19,10 +19,11 @@ _TRAIN_START_TIME = time.time()
 import torch
 
 from megatron.core import mpu, tensor_parallel
-from megatron.core.utils import get_model_config
+from megatron.core.utils import get_model_config, StragglerDetector
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.legacy.model import Float16Module
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
@@ -32,6 +33,7 @@ from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
+from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.pipeline_parallel import get_forward_backward_func
 
 from .utils import (
@@ -54,6 +56,8 @@ from .global_vars import (
     update_num_microbatches)
 
 
+stimer = StragglerDetector()
+
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
     torch.distributed.barrier()
@@ -62,6 +66,9 @@ def print_datetime(string):
 
 
 def num_floating_point_operations(args, batch_size):
+    # Attention projection size.
+    query_projection_size = args.kv_channels * args.num_attention_heads
+    query_projection_to_hidden_size_ratio = query_projection_size / args.hidden_size
     # Group Query Attention.
     if not args.group_query_attention:
         args.num_query_groups = args.num_attention_heads
@@ -76,14 +83,21 @@ def num_floating_point_operations(args, batch_size):
         * args.hidden_size
         * args.hidden_size
         * (
-            1
+            # Attention.
+            (
+                (
+                    1
+                    + (args.num_query_groups / args.num_attention_heads)
+                    + (args.seq_length / args.hidden_size)
+                ) * query_projection_to_hidden_size_ratio
+            )
+            # MLP.
             + (
                 (args.ffn_hidden_size / args.hidden_size)
                 * num_experts_routed_to
                 * gated_linear_multiplier
             )
-            + (args.num_query_groups / args.num_attention_heads)
-            + (args.seq_length / args.hidden_size)
+            # Logit.
             + (args.padded_vocab_size / (2 * args.num_layers * args.hidden_size))
         )
     )
@@ -163,7 +177,7 @@ def pretrain(train_valid_test_dataset_provider,
         3) call train_val_test_data_provider to get train/val/test datasets.
         4) train the modle using the forward_step_func.
 
-    Arguments:
+    Args:
         train_valid_test_dataset_provider: a function that takes the size of
             train/valid/test dataset and returns `train, valid, test` datasets.
         model_provider: a function that returns a vanilla version of the
@@ -409,17 +423,20 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if wrap_with_ddp:
         config = get_model_config(model[0])
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=args.accumulate_allreduce_grads_in_fp32,
+            overlap_grad_reduce=args.overlap_grad_reduce,
+            use_distributed_optimizer=args.use_distributed_optimizer,
+            check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad,
+            bucket_size=args.ddp_bucket_size)
         model = [DDP(config,
+                     ddp_config,
                      model_chunk,
                      data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
                      expert_data_parallel_group=mpu.get_data_modulo_expert_parallel_group(),
-                     accumulate_allreduce_grads_in_fp32=args.accumulate_allreduce_grads_in_fp32,
-                     overlap_grad_reduce=args.overlap_grad_reduce,
-                     use_distributed_optimizer=args.use_distributed_optimizer,
                      # Turn off bucketing for model_chunk 2 onwards, since communication for these
                      # model chunks is overlapped with compute anyway.
-                     disable_bucketing=(model_chunk_idx > 0),
-                     check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad)
+                     disable_bucketing=(model_chunk_idx > 0))
                  for (model_chunk_idx, model_chunk) in enumerate(model)]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
@@ -502,7 +519,7 @@ def setup_model_and_optimizer(model_provider_func,
                                        scale_lr_cond, lr_mult)
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
-    if args.load is not None:
+    if args.load is not None or args.pretrained_checkpoint is not None:
         timers('load-checkpoint', log_level=0).start(barrier=True)
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
             model, optimizer, opt_param_scheduler)
@@ -590,7 +607,7 @@ def train_step(forward_step_func, data_iterator,
     return {}, skipped_iter, grad_norm, num_zeros_in_grad
 
 
-def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
+def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
                  grad_norm, params_norm, num_zeros_in_grad):
     """Log training information such as losses, timing, ...."""
@@ -681,6 +698,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                              iteration)
         if args.log_learning_rate_to_tensorboard:
             writer.add_scalar('learning-rate', learning_rate, iteration)
+            if args.decoupled_lr is not None:
+                writer.add_scalar('decoupled-learning-rate', decoupled_learning_rate, iteration)
             writer.add_scalar('learning-rate vs samples', learning_rate,
                               args.consumed_train_samples)
             if wandb_writer:
@@ -744,6 +763,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 mem_stats["allocation.all.current"],
                 iteration,
             )
+    if args.num_experts is not None:
+        moe_loss_scale = 1 / get_num_microbatches()
+        track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging)
 
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed(barrier=True)
@@ -772,7 +794,15 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                     writer.add_scalar('throughput', throughput, iteration)
                 if wandb_writer:
                     wandb_writer.log({'throughput': throughput}, iteration)
-        log_string += ' learning rate: {:.3E} |'.format(learning_rate)
+        assert learning_rate is not None
+        # Decoupled_learning_rate should be not None only on first and last pipeline stage.
+        log_string += ' learning rate: {:.6E} |'.format(learning_rate)
+        if args.decoupled_lr is not None and (mpu.is_pipeline_first_stage(ignore_virtual=True) or
+                                              mpu.is_pipeline_last_stage(ignore_virtual=True)):
+            assert decoupled_learning_rate is not None
+            log_string += ' decoupled learning rate: {:.6E} |'.format(decoupled_learning_rate)
+        else:
+            assert decoupled_learning_rate is None
         log_string += ' global batch size: {:5d} |'.format(batch_size)
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key,
@@ -926,6 +956,18 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         gc.disable()
         gc.collect()
 
+    # Singleton Initialization
+    if args.log_straggler:
+        global stimer
+        world = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        mmcnt = args.straggler_minmax_count
+        stimer.configure(world, rank,
+                mmcnt = mmcnt,
+                enabled = not args.disable_straggler_on_startup,
+                port = args.straggler_ctrlr_port)
+    total_flops = 0.0
+
     num_microbatches = get_num_microbatches()
     eval_duration = 0.0
     eval_iterations = 0
@@ -984,7 +1026,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                      args.micro_batch_size * \
                      get_num_microbatches()
         args.consumed_train_samples += batch_size
-        num_floating_point_operations_so_far += num_floating_point_operations(args, batch_size)
+        num_fp_ops = num_floating_point_operations(args, batch_size)
+        num_floating_point_operations_so_far += num_fp_ops
+        total_flops += num_fp_ops
 
         # Logging.
         loss_scale = optimizer.get_loss_scale().item()
@@ -995,11 +1039,23 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if iteration % args.log_interval == 0:
             track_e2e_metrics()
 
+        learning_rate = None
+        decoupled_learning_rate = None
+        for param_group in optimizer.param_groups:
+            if param_group['is_decoupled_lr']:
+                decoupled_learning_rate = param_group['lr']
+            else:
+                learning_rate = param_group['lr']
         report_memory_flag = training_log(loss_dict, total_loss_dict,
-                                          optimizer.param_groups[0]['lr'],
+                                          learning_rate,
+                                          decoupled_learning_rate,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, num_zeros_in_grad)
+        # StragglerDetector
+        if iteration % args.log_interval == 0 and args.log_straggler:
+            stimer.report(total_flops, args.log_interval)
+            total_flops = 0.0
 
         # Autoresume
         if args.adlr_autoresume and \
